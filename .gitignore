@@ -1,0 +1,14 @@
+#nextflow 
+.nextflow*
+
+#Non-test Samplesheets
+Samplesheets/*
+
+#data
+data
+
+#ignore work directory
+work
+
+#results
+results*

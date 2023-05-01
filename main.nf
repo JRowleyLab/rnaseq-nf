@@ -5,9 +5,10 @@
 params.samplesheet = "${baseDir}/Samplesheets/samples_test.csv"
 params.outdir = "${baseDir}/results"
 params.index = "/Zulu/bnolan/Indexes/STARindexhg38/"
-params.gtf = "/Zulu/bnolan/genome/gtf/hg38.ensGene.gtf"
+params.gtf = "/Zulu/bnolan/genome/human/gtf/hg38.ensGene.gtf"
 params.threads = "4"
 params.notrim = ""
+params.singleend = ""
 
 
 log.info """\
@@ -19,17 +20,31 @@ log.info """\
          threads      : ${params.threads}
          index        : ${params.index}
          gtf          : ${params.gtf}
+         single-end   : ${params.singleend}
+
+         trim         : ${params.notrim}
 
          """
          .stripIndent()
 
 
-// Parse samplesheet and create reads channel            
-Channel
+// Parse samplesheet and create reads channel; 
+// dependent on single-end or paired-end sequencing   
+
+if(params.singleend){
+    Channel
+        .from ( file(params.samplesheet) )
+        .splitCsv(header:true, sep:',')
+        .map { row -> [ row.sample_id, [ file(row.fastq_1, checkIfExists: true) ]] }
+        .set { read_pairs_ch }
+} else {
+    Channel
         .from ( file(params.samplesheet) )
         .splitCsv(header:true, sep:',')
         .map { row -> [ row.sample_id, [ file(row.fastq_1, checkIfExists: true), file(row.fastq_2, checkIfExists: true) ]] }
-        .into { read_pairs_ch; read_pairs_ch2; read_pairs_ch3 }
+        .set { read_pairs_ch }
+}
+
 
 
 // Create channel for Index
@@ -43,13 +58,69 @@ Channel
         .set{gtf_ch}
 
 
+// // Concatenate reads of same sample [e.g. additional lanes, resequencing of old samples]
+//nfcore
+read_pairs_ch
+        .groupTuple()
+        .branch {
+            meta, fastq ->
+                single  : fastq.size() == 1
+                    return [ meta, fastq.flatten() ]
+                multiple: fastq.size() > 1
+                    return [ meta, fastq.flatten() ]
+        }
+        .set { ch_fastq }  
+
+
+// Concatenate 
+process CAT_FASTQ {
+    //nf-core
+    tag "$sample_id"
+    publishDir "${params.outdir}/fastqMerged", mode: 'copy'
+
+    input:
+    tuple val(sample_id), path(reads, stageAs: "input*/*") from ch_fastq.multiple
+
+    output:
+    tuple val(sample_id), path("*.merged.fastq.gz") into cat_out_ch
+
+
+    script:
+    def readList = reads instanceof List ? reads.collect{ it.toString() } : [reads.toString()]
+
+    if (params.singleend) {
+            if (readList.size >= 1) {
+                """
+                cat ${readList.join(' ')} > ${sample_id}.merged.fastq.gz
+                """
+            }
+        } else {
+            if (readList.size >= 2) {
+                def read1 = []
+                def read2 = []
+                readList.eachWithIndex{ v, ix -> ( ix & 1 ? read2 : read1 ) << v }
+                """
+                cat ${read1.join(' ')} > ${sample_id}_1.merged.fastq.gz
+                cat ${read2.join(' ')} > ${sample_id}_2.merged.fastq.gz
+                """
+            }
+        }
+}
+
+//mix merged reads with singles
+cat_out_ch
+        .mix(ch_fastq.single)
+        .into { cat_merged_ch; cat_merged_ch2; cat_merged_ch3 }
+
+
+
 //  Run fastQC to check quality of reads files
 process fastqc {
     tag "$sample_id"
     publishDir "${params.outdir}/fastqc", pattern:"{*.html,fastqc_${sample_id}_logs}", mode: 'copy'
 
     input:
-    tuple val(sample_id), path(reads) from read_pairs_ch
+    tuple val(sample_id), path(reads) from cat_merged_ch
 
     output:
     path("fastqc_${sample_id}_logs") into fastqc_ch
@@ -69,7 +140,7 @@ process trimming {
     publishDir "${params.outdir}/trimmed", pattern: "*.fq.gz", mode: 'copy'
 
     input: 
-    tuple val(key), path(reads) from read_pairs_ch2
+    tuple val(key), path(reads) from cat_merged_ch2
 
     when:
     !params.notrim
@@ -79,18 +150,31 @@ process trimming {
 
     script:
 
-    """
-    trim_galore \\
-                --paired \\
-                ${reads[0]} \\
-                ${reads[1]} \\
-                --basename $key \\
-                --cores 1 
-    """
+    if(params.singleend){
+
+        """
+        trim_galore \\
+                    $reads \\
+                    --basename $key \\
+                    --cores 1 
+        """
+
+    } else {
+
+        """
+        trim_galore \\
+                    --paired \\
+                    ${reads[0]} \\
+                    ${reads[1]} \\
+                    --basename $key \\
+                    --cores 1 
+        """
+    }
+
+    
 }
 
-reads_out_ch = params.notrim ? read_pairs_ch3 : reads_trimmed_ch
-
+reads_out_ch = params.notrim ? cat_merged_ch3 : reads_trimmed_ch
 
 
 // Align reads to index 
@@ -117,7 +201,6 @@ process STAR {
                 --readFilesCommand zcat \\
                 --outFileNamePrefix $key \\
                 --outStd SAM \\
-                --outSAMstrandField intronMotif \\
                 | samtools view -@ $params.threads -bhS -o ${key}.bam -
                 
         """  
